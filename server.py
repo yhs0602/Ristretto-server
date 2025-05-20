@@ -1,18 +1,21 @@
 # server.py
 import time
-import json
 import torch
 import requests
 import logging
 import uvicorn
 from io import BytesIO
 from PIL import Image
-from typing import List, Optional, Union, Dict, Any
+from typing import List, Optional, Union, Dict
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from torchvision import transforms as T
 from torchvision.transforms.functional import InterpolationMode
 from transformers import AutoModel, AutoTokenizer
+from pydantic import BaseModel
+from typing import List, Union, Literal, Optional
+import base64
+from PIL import Image
 
 # ─── 로깅 설정 ─────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -86,15 +89,25 @@ def dynamic_preprocess(
     return blocks
 
 
-def load_image_from_url(url: str, input_size=384, max_num=10):
-    resp = requests.get(url, timeout=10)
-    img = Image.open(BytesIO(resp.content)).convert("RGB")
-    imgs = dynamic_preprocess(
-        img, image_size=input_size, use_thumbnail=True, max_num=max_num
+def load_image_from_url(url: str) -> torch.Tensor:
+    if url.startswith("data:image"):
+        # Base64 데이터 처리
+        header, base64_data = url.split(",", 1)
+        image_data = base64.b64decode(base64_data)
+        image = Image.open(BytesIO(image_data)).convert("RGB")
+    else:
+        # 일반 URL 다운로드
+        response = requests.get(url)
+        image = Image.open(BytesIO(response.content)).convert("RGB")
+
+    # 여기부터 기존 전처리 유지
+    input_size = 384
+    transform = build_transform(input_size)
+    blocks = dynamic_preprocess(
+        image, image_size=input_size, use_thumbnail=True, max_num=10
     )
-    tf = build_transform(input_size)
-    pix = torch.stack([tf(im) for im in imgs])
-    return pix.to(torch.bfloat16).to(DEVICE)
+    pixel_values = torch.stack([transform(im) for im in blocks])
+    return pixel_values.to(torch.bfloat16).to(DEVICE)
 
 
 logger.info("Loading model...")
@@ -152,6 +165,119 @@ class ChatCompletionResponse(BaseModel):
 @app.get("/v1/models")
 def list_models():
     return {"object": "list", "data": [{"id": MODEL_NAME, "object": "model"}]}
+
+
+class InputText(BaseModel):
+    type: Literal["input_text"]
+    text: str
+
+
+class InputImage(BaseModel):
+    type: Literal["input_image"]
+    image_url: str
+
+
+InputContent = Union[InputText, InputImage]
+
+
+class ResponsesInput(BaseModel):
+    role: Literal["user", "assistant"]
+    content: List[InputContent]
+
+
+class ResponsesRequest(BaseModel):
+    model: str
+    input: Union[ResponsesInput, List[ResponsesInput]]
+    instructions: Optional[str] = None
+    max_output_tokens: Optional[int] = None
+    temperature: Optional[float] = 1.0
+    top_p: Optional[float] = 1.0
+    stream: Optional[bool] = False
+    # (생략) include, metadata, parallel_tool_calls, etc.
+
+
+class ResponseMessage(BaseModel):
+    type: Literal["message"]
+    role: Literal["assistant"]
+    content: List[dict]
+
+
+class ResponsesResponse(BaseModel):
+    id: str
+    object: str = "response"
+    created_at: int
+    status: str = "completed"
+    output: List[ResponseMessage]
+    model: str
+    usage: dict
+
+
+# ─── 핸들러 추가 ────────────────────────────────────────────────────────────
+@app.post("/v1/responses", response_model=ResponsesResponse)
+async def create_response(req: ResponsesRequest):
+    if req.model != MODEL_NAME:
+        raise HTTPException(status_code=400, detail=f"Model {req.model} not available")
+
+    # input이 ResponsesInput 단일일 수도 있고 리스트일 수도 있음
+    inputs = req.input if isinstance(req.input, list) else [req.input]
+
+    vision_inputs = []
+    prompt_parts = []
+
+    for message in inputs:
+        role = message.role
+        for content_item in message.content:
+            if content_item.type == "input_text":
+                prompt_parts.append(content_item.text)
+            elif content_item.type == "input_image":
+                # 여러 이미지가 들어올 수 있으므로 append
+                img_tensor = load_image_from_url(content_item.image_url)
+                vision_inputs.append(img_tensor)
+                prompt_parts.append("<image>")
+
+    # vision_inputs: 여러 이미지가 있을 경우 batch 처리용으로 stack
+    if vision_inputs:
+        vision_tensor = torch.cat(vision_inputs, dim=0)
+    else:
+        vision_tensor = None
+
+    prompt = "\n".join(prompt_parts)
+
+    gen_cfg = {
+        "max_new_tokens": req.max_output_tokens or 2048,
+        "temperature": req.temperature,
+        "top_p": req.top_p,
+    }
+
+    # 모델 호출
+    text, _ = model.chat(
+        tokenizer,
+        vision_tensor,
+        prompt,
+        gen_cfg,
+        history=None,
+        return_history=True,
+    )
+
+    msg = ResponseMessage(
+        type="message",
+        role="assistant",
+        content=[{"type": "output_text", "text": text, "annotations": []}],
+    )
+
+    usage = {
+        "input_tokens": 0,  # TODO: tokenizer로 계산 가능
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+
+    return ResponsesResponse(
+        id=f"resp_{int(time.time())}",
+        created_at=int(time.time()),
+        output=[msg],
+        model=req.model,
+        usage=usage,
+    )
 
 
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
